@@ -4,7 +4,7 @@ import json
 # Настройки подключения к базе данных Neo4j
 uri = "bolt://localhost:7687"  # Адрес вашего Neo4j сервера
 user = "neo4j"  # Имя пользователя
-password = "pin62gvin07"  # Пароль
+password = "passwd"  # Пароль
 
 # Путь к вашим JSON-файлам
 json_files = {
