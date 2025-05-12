@@ -1,0 +1,428 @@
+import sys
+import numpy as np
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QVBoxLayout, QWidget, QLineEdit,
+    QPushButton, QTextEdit, QLabel, QComboBox, QHBoxLayout, 
+    QInputDialog, QListWidget, QSplitter, QListWidgetItem, QTabWidget,
+    QGroupBox, QFormLayout
+)
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QFont, QColor
+import pyqtgraph as pg
+from neo4j import GraphDatabase
+from neo4j.graph import Path
+import networkx as nx
+
+
+class Neo4jGraphViewer(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("IPA_Hound")
+        self.setGeometry(100, 100, 1600, 900)
+
+        self.driver = GraphDatabase.driver(
+            "bolt://localhost:7687",
+            auth=("neo4j", "passwd")
+        )
+
+        # Главный виджет и разметка
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        # Разделитель для основной области и боковой панели
+        splitter = QSplitter(Qt.Horizontal)
+        
+        # Основная область с графиком
+        main_area = QWidget()
+        main_layout = QVBoxLayout(main_area)
+        
+        # Боковая панель со списками узлов
+        self.side_panel = QWidget()
+        side_layout = QVBoxLayout(self.side_panel)
+        
+        # Добавляем виджеты в разделитель
+        splitter.addWidget(main_area)
+        splitter.addWidget(self.side_panel)
+        splitter.setSizes([1200, 400])
+        
+        # Устанавливаем разделитель как центральный виджет
+        central_layout = QVBoxLayout(central_widget)
+        central_layout.addWidget(splitter)
+
+        # Панель управления запросами
+        control_panel = QWidget()
+        control_layout = QHBoxLayout(control_panel)
+        
+        self.query_input = QLineEdit()
+        self.query_input.setPlaceholderText("MATCH (n)-[r]->(m) RETURN n, r, m LIMIT 100")
+        self.query_input.setMinimumWidth(500)
+
+        self.execute_button = QPushButton("Выполнить запрос")
+        self.execute_button.clicked.connect(self.execute_query)
+
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems([
+            "Все узлы и связи (LIMIT 100)",
+            "Кратчайший путь между узлами",
+            "Поиск по имени узла",
+        ])
+        self.preset_combo.currentIndexChanged.connect(self.load_preset_query)
+
+        control_layout.addWidget(QLabel("Запрос:"))
+        control_layout.addWidget(self.query_input)
+        control_layout.addWidget(self.preset_combo)
+        control_layout.addWidget(self.execute_button)
+        main_layout.addWidget(control_panel)
+
+        # Граф
+        self.graph_widget = pg.GraphicsLayoutWidget()
+        self.graph_widget.setBackground('w')
+        main_layout.addWidget(self.graph_widget, stretch=1)
+
+        # Результаты запроса
+        self.result_text = QTextEdit()
+        self.result_text.setReadOnly(True)
+        self.result_text.setMaximumHeight(150)
+        main_layout.addWidget(self.result_text)
+
+        # Легенда цветов
+        legend = QGroupBox("Легенда цветов узлов")
+        legend_layout = QFormLayout()
+        legend.setLayout(legend_layout)
+        
+        colors = [
+            ("Пользователи", QColor(255, 100, 100)),
+            ("Группы", QColor(100, 100, 255)),
+            ("Роли", QColor(100, 255, 100)),
+            ("Привилегии", QColor(255, 165, 0)),
+            ("Разрешения", QColor(255, 0, 255)),
+            ("Другие", QColor(200, 200, 200))
+        ]
+        
+        for label, color in colors:
+            color_label = QLabel()
+            color_label.setStyleSheet(f"background-color: {color.name()};")
+            color_label.setFixedSize(20, 20)
+            legend_layout.addRow(color_label, QLabel(label))
+        
+        # Боковая панель - списки узлов
+        self.node_lists = {
+            'User': QListWidget(),
+            'Group': QListWidget(),
+            'Role': QListWidget(),
+            'Privilege': QListWidget(),
+            'Permission': QListWidget(),
+            'Other': QListWidget()
+        }
+        
+        # Создаем вкладки для каждого типа узлов
+        self.tab_widget = QTabWidget()
+        for label, widget in self.node_lists.items():
+            tab = QWidget()
+            tab_layout = QVBoxLayout(tab)
+            tab_layout.addWidget(QLabel(f"{label} ({widget.count()})"))
+            tab_layout.addWidget(widget)
+            self.tab_widget.addTab(tab, label)
+            widget.itemDoubleClicked.connect(self.on_node_double_click)
+        
+        # Добавляем элементы на боковую панель
+        side_layout.addWidget(legend)
+        side_layout.addWidget(self.tab_widget)
+        
+        # Загружаем все узлы при старте
+        self.load_all_nodes()
+        self.plot_graph()
+
+    def load_all_nodes(self):
+        query = """
+        MATCH (n) 
+        RETURN labels(n) as labels, n.id as id, n.name as name
+        ORDER BY labels(n)[0], coalesce(n.id, n.name)
+        """
+        
+        with self.driver.session() as session:
+            result = session.run(query)
+            
+            # Очищаем списки
+            for widget in self.node_lists.values():
+                widget.clear()
+            
+            for record in result:
+                labels = record['labels']
+                node_id = record.get('id', record.get('name', 'Unknown'))
+                node_type = labels[0] if labels else 'Other'
+                
+                if node_type not in self.node_lists:
+                    node_type = 'Other'
+                
+                item = QListWidgetItem(node_id)
+                item.setData(Qt.UserRole, node_type)
+                self.node_lists[node_type].addItem(item)
+            
+            # Обновляем заголовки с количеством
+            for i in range(self.tab_widget.count()):
+                label = self.tab_widget.tabText(i)
+                count = self.node_lists[label].count()
+                self.tab_widget.setTabText(i, f"{label} ({count})")
+
+    def on_node_double_click(self, item):
+        node_id = item.text()
+        node_type = item.data(Qt.UserRole)
+        query = f"""
+        MATCH (n:{node_type} {{id: "{node_id}"}})-[r]-(related)
+        RETURN n, r, related
+        """
+        self.query_input.setText(query)
+        self.execute_query()
+
+    def load_preset_query(self, index):
+        presets = [
+            "MATCH (n)-[r]->(m) RETURN n, r, m LIMIT 100",
+            "MATCH path = shortestPath((u1:$type1 {id: $node1})-[*]->(u2:$type2 {id: $node2})) RETURN path",
+            "MATCH (n) WHERE n.id = $search OR n.name = $search WITH n MATCH (n)-[r]-(related) RETURN n, r, related",
+            "MATCH (n:User)-[r]-(related) WHERE 'ceo' IN n.uid RETURN n, r, related"
+        ]
+        self.query_input.setText(presets[index])
+
+    def fetch_graph_data(self, query):
+        G = nx.DiGraph()
+        node_data = {}
+
+        with self.driver.session() as session:
+            result = session.run(query)
+            for record in result:
+                for key in record.keys():
+                    val = record[key]
+
+                    if isinstance(val, Path):
+                        # Обработка Path
+                        for node in val.nodes:
+                            if node.id not in node_data:
+                                labels = list(node.labels)
+                                props = dict(node)
+                                display_name = props.get('id', props.get('cn', str(node.id)))
+                                node_data[node.id] = {
+                                    'labels': labels,
+                                    'properties': props,
+                                    'display_name': display_name,
+                                    'color': self.get_node_color(labels)
+                                }
+                        for rel in val.relationships:
+                            u = rel.start_node.id
+                            v = rel.end_node.id
+                            G.add_edge(u, v, type=rel.type, properties=dict(rel))
+
+                    elif isinstance(val, list):
+                        for item in val:
+                            if hasattr(item, "start_node") and hasattr(item, "end_node"):
+                                u = item.start_node.id
+                                v = item.end_node.id
+                                G.add_edge(u, v, type=item.type, properties=dict(item))
+                                for node in [item.start_node, item.end_node]:
+                                    if node.id not in node_data:
+                                        labels = list(node.labels)
+                                        props = dict(node)
+                                        display_name = props.get('id', props.get('cn', str(node.id)))
+                                        node_data[node.id] = {
+                                            'labels': labels,
+                                            'properties': props,
+                                            'display_name': display_name,
+                                            'color': self.get_node_color(labels)
+                                        }
+                    elif hasattr(val, "start_node") and hasattr(val, "end_node"):
+                        u = val.start_node.id
+                        v = val.end_node.id
+                        G.add_edge(u, v, type=val.type, properties=dict(val))
+                        for node in [val.start_node, val.end_node]:
+                            if node.id not in node_data:
+                                labels = list(node.labels)
+                                props = dict(node)
+                                display_name = props.get('id', props.get('cn', str(node.id)))
+                                node_data[node.id] = {
+                                    'labels': labels,
+                                    'properties': props,
+                                    'display_name': display_name,
+                                    'color': self.get_node_color(labels)
+                                }
+                    elif hasattr(val, "labels"):
+                        if val.id not in node_data:
+                            labels = list(val.labels)
+                            props = dict(val)
+                            display_name = props.get('id', props.get('cn', str(val.id)))
+                            node_data[val.id] = {
+                                'labels': labels,
+                                'properties': props,
+                                'display_name': display_name,
+                                'color': self.get_node_color(labels)
+                            }
+
+        for node_id, data in node_data.items():
+            G.add_node(node_id, **data)
+
+        return G
+
+    def get_node_color(self, labels):
+        if 'User' in labels:
+            return (255, 100, 100, 220)  # Красный
+        elif 'Group' in labels:
+            return (100, 100, 255, 220)  # Синий
+        elif 'Role' in labels:
+            return (100, 255, 100, 220)  # Зеленый
+        elif 'Privilege' in labels:
+            return (255, 165, 0, 220)    # Оранжевый
+        elif 'Permission' in labels:
+            return (255, 0, 255, 220)    # Фиолетовый
+        else:
+            return (200, 200, 200, 220)  # Серый
+
+    def plot_graph(self, query=None):
+        self.graph_widget.clear()
+
+        if query is None:
+            query = "MATCH (n)-[r]->(m) RETURN n, r, m LIMIT 100"
+
+        try:
+            G = self.fetch_graph_data(query)
+
+            if len(G.nodes) == 0:
+                self.result_text.append("Граф пуст. Нет данных для отображения.")
+                return
+
+            pos = nx.spring_layout(G, k=0.3, iterations=50)
+
+            nodes = np.array([pos[node] for node in G.nodes()])
+            edges = np.array([(list(G.nodes()).index(u), list(G.nodes()).index(v)) for u, v in G.edges()])
+            colors = [G.nodes[node]['color'] for node in G.nodes()]
+            sizes = [50 if 'User' in G.nodes[node]['labels'] else 45 for node in G.nodes()]
+
+            graph_item = pg.GraphItem()
+            graph_item.setData(
+                pos=nodes,
+                adj=edges,
+                size=sizes,
+                symbolPen={'color': 'k', 'width': 3},
+                symbolBrush=colors,
+                pen={'width': 3, 'color': (100, 100, 100, 150)},
+                pxMode=True
+            )
+
+            view = self.graph_widget.addViewBox()
+            view.addItem(graph_item)
+            view.setAspectLocked(True)
+
+            # Подписи узлов - с центрированием
+            node_font = QFont('Arial', 12)
+            node_font.setBold(True)
+            for node in G.nodes():
+                x, y = pos[node]
+                display_name = G.nodes[node]['display_name']
+                
+                # Сокращаем длинные имена
+                if len(display_name) > 15:
+                    display_name = display_name[:12] + "..."
+                
+                text = pg.TextItem(text=display_name, color=(20, 20, 20))
+                text.setFont(node_font)
+                text.setAnchor((0.5, 0.5))  # Центрирование текста
+                text.setPos(x, y)
+                view.addItem(text)
+
+            # Подписи связей
+            edge_font = QFont('Arial', 10)
+            edge_font.setBold(True)
+            for u, v, data in G.edges(data=True):
+                if 'type' in data:
+                    x = (pos[u][0] + pos[v][0]) / 2
+                    y = (pos[u][1] + pos[v][1]) / 2
+                    edge_text = pg.TextItem(text=data['type'], color=(70, 70, 70))
+                    edge_text.setFont(edge_font)
+                    edge_text.setAnchor((0.5, 0.5))
+                    edge_text.setPos(x, y)
+                    view.addItem(edge_text)
+
+            edge_labels = {}
+            for u, v, data in G.edges(data=True):
+                if 'type' in data:
+                    edge_type = data['type']
+                    if edge_type not in edge_labels:
+                        edge_labels[edge_type] = 0
+                    edge_labels[edge_type] += 1
+
+            edge_stats = "\n".join([f"{k}: {v}" for k, v in edge_labels.items()])
+            self.result_text.append(f"Типы связей:\n{edge_stats}")
+            self.result_text.append(f"\nУспешно отображено {len(G.nodes)} узлов и {len(G.edges)} связей.")
+
+            view.setMouseEnabled(x=True, y=True)
+
+        except Exception as e:
+            self.result_text.append(f"Ошибка: {str(e)}")
+
+    def execute_query(self):
+        query = self.query_input.text().strip()
+        if not query:
+            query = "MATCH (n)-[r]->(m) RETURN n, r, m LIMIT 100"
+
+        # Если это запрос поиска по имени
+        if "$search" in query:
+            search_value, ok = QInputDialog.getText(self, "Поиск узла", "Введите имя узла:")
+            if ok and search_value:
+                query = query.replace("$search", f'"{search_value}"')
+            else:
+                return
+
+        # Если это запрос кратчайшего пути
+        if "shortestPath" in query and ("$node1" in query or "$type1" in query):
+            node1, ok1 = QInputDialog.getText(self, "Кратчайший путь", "Введите имя первого узла:")
+            if not ok1 or not node1:
+                return
+            
+            type1, ok1 = QInputDialog.getItem(self, "Тип узла", "Выберите тип первого узла:", 
+                                             ["User", "Group", "Role", "Privilege", "Permission"], 0, False)
+            if not ok1:
+                return
+            
+            node2, ok2 = QInputDialog.getText(self, "Кратчайший путь", "Введите имя второго узла:")
+            if not ok2 or not node2:
+                return
+            
+            type2, ok2 = QInputDialog.getItem(self, "Тип узла", "Выберите тип второго узла:", 
+                                             ["User", "Group", "Role", "Privilege", "Permission"], 0, False)
+            if not ok2:
+                return
+            
+            query = query.replace("$node1", f'"{node1}"') \
+                         .replace("$type1", type1) \
+                         .replace("$node2", f'"{node2}"') \
+                         .replace("$type2", type2)
+
+        self.result_text.clear()
+        self.result_text.append(f"Выполнение запроса:\n{query}")
+        self.plot_graph(query)
+
+    def closeEvent(self, event):
+        self.driver.close()
+        event.accept()
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setStyle('Fusion')
+    palette = app.palette()
+    palette.setColor(palette.Window, QColor(255, 255, 255))
+    palette.setColor(palette.WindowText, Qt.black)
+    palette.setColor(palette.Base, QColor(255, 255, 255))
+    palette.setColor(palette.AlternateBase, QColor(240, 240, 240))
+    palette.setColor(palette.ToolTipBase, Qt.white)
+    palette.setColor(palette.ToolTipText, Qt.black)
+    palette.setColor(palette.Text, Qt.black)
+    palette.setColor(palette.Button, QColor(240, 240, 240))
+    palette.setColor(palette.ButtonText, Qt.black)
+    palette.setColor(palette.BrightText, Qt.red)
+    palette.setColor(palette.Link, QColor(42, 130, 218))
+    palette.setColor(palette.Highlight, QColor(42, 130, 218))
+    palette.setColor(palette.HighlightedText, Qt.white)
+    app.setPalette(palette)
+
+    window = Neo4jGraphViewer()
+    window.show()
+    sys.exit(app.exec_())
